@@ -154,79 +154,194 @@ class AttentionalResnetEncoder(ResnetEncoder):
         return self.features
     
 
-class MultiHeadAttention(nn.Module):
-    """Multi-head self-attention module
-    多头自注意力模块
+class PatchBasedMultiHeadAttention(nn.Module):
+    """基于patch的多头注意力模块，生成attention map
+    Patch-based multi-head attention module that generates attention maps
     """
-    def __init__(self, channels, num_heads=8, dropout=0.1):
-        super(MultiHeadAttention, self).__init__()
-        if channels % num_heads != 0:
-            raise ValueError(f"channels ({channels}) must be divisible by num_heads ({num_heads})")
-            
+    def __init__(self, channels, num_heads=8, patch_size=8, dropout=0.1):
+        super(PatchBasedMultiHeadAttention, self).__init__()
+        
+        self.channels = channels
         self.num_heads = num_heads
-        self.head_dim = channels // num_heads
-        self.scale = self.head_dim ** -0.5
+        self.patch_size = patch_size
         
-        # 使用1x1卷积进行线性变换 / Use 1x1 convolution for linear transformation
-        # Use 1x1 convolution for linear transformation
-        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1, bias=False)
-        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
+        # embedding维度增加为resnet维度
+        # Increase embedding dimension to resnet dimension
+        self.embed_dim = channels
         
-        self.attn_drop = nn.Dropout(dropout)
-        self.proj_drop = nn.Dropout(dropout)
+        # 输入投影层：将patch转换为embedding
+        # Input projection layer: convert patch to embedding
+        self.patch_embed = nn.Sequential(
+            nn.Conv2d(channels, self.embed_dim, kernel_size=patch_size, stride=patch_size),
+            nn.GroupNorm(num_groups=1, num_channels=self.embed_dim),
+            nn.GELU()
+        )
         
-        # 添加层归一化 / Add layer normalization
-        # Add layer normalization
-        self.norm = nn.LayerNorm([channels])
+        # 使用PyTorch自带的多头注意力
+        # Use PyTorch's native multi-head attention
+        self.multihead_attn = nn.MultiheadAttention(
+            embed_dim=self.embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True  # 使用(batch, seq_len, embed_dim)格式
+        )
+        
+        # 位置编码（可学习）
+        # Positional encoding (learnable)
+        self.pos_embed = nn.Parameter(torch.randn(1, 1024, self.embed_dim) * 0.02)  # 支持最大32x32的patch网格
+        
+        # 归一化层
+        # Normalization layer
+        self.norm = nn.LayerNorm(self.embed_dim)
+        
+        # 多次升采样和卷积来恢复原始尺寸
+        # Multiple upsampling and convolution to restore original size
+        self.upsample_layers = nn.ModuleList()
+        current_dim = self.embed_dim
+        
+        # 计算需要的上采样次数（假设patch_size=8需要3次上采样：1->2->4->8）
+        # Calculate required upsampling times (assuming patch_size=8 needs 3 upsamples: 1->2->4->8)
+        num_upsample = int(np.log2(patch_size)) if patch_size > 1 else 0
+        
+        if num_upsample > 0:
+            for i in range(num_upsample):
+                # 每次上采样后减少通道数
+                # Reduce channels after each upsampling
+                next_dim = current_dim // 2 if i < num_upsample - 1 else channels
+                
+                self.upsample_layers.append(nn.Sequential(
+                    nn.ConvTranspose2d(current_dim, next_dim, kernel_size=3, stride=2, padding=1, output_padding=1),
+                    nn.GroupNorm(num_groups=1, num_channels=next_dim),
+                    nn.GELU() if i < num_upsample - 1 else nn.Identity()
+                ))
+                current_dim = next_dim
+        else:
+            # 如果patch_size=1，直接降维到原始通道数
+            # If patch_size=1, directly reduce to original channels
+            self.upsample_layers.append(nn.Sequential(
+                nn.Conv2d(current_dim, channels, kernel_size=1),
+                nn.GroupNorm(num_groups=1, num_channels=channels),
+                nn.GELU()
+            ))
+        
+        # 最终的attention map生成层
+        # Final attention map generation layer
+        self.attention_conv = nn.Sequential(
+            nn.Conv2d(channels, channels // 4, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 4, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
         
     def forward(self, x):
         B, C, H, W = x.shape
         
-        # 首先进行LayerNorm，注意维度转换 / First perform LayerNorm, note the dimension conversion
-        # First perform LayerNorm, note the dimension conversion
-        x_norm = self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        # 确保尺寸能被patch_size整除
+        # Ensure dimensions are divisible by patch_size
+        pad_h = (self.patch_size - H % self.patch_size) % self.patch_size
+        pad_w = (self.patch_size - W % self.patch_size) % self.patch_size
         
-        # 生成q, k, v / Generate q, k, v
-        # Generate q, k, v
-        qkv = self.qkv(x_norm)
-        qkv = qkv.reshape(B, 3, self.num_heads, self.head_dim, H, W)
-        qkv = qkv.permute(1, 0, 2, 4, 5, 3)  # 3, B, num_heads, H, W, head_dim
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        if pad_h > 0 or pad_w > 0:
+            x = torch.nn.functional.pad(x, (0, pad_w, 0, pad_h))
+            _, _, H_pad, W_pad = x.shape
+        else:
+            H_pad, W_pad = H, W
         
-        # 计算注意力分数 / Calculate attention scores
-        # Calculate attention scores
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        # 分patch并投影到embedding空间
+        # Split into patches and project to embedding space
+        patch_embed = self.patch_embed(x)  # (B, embed_dim, H_patches, W_patches)
         
-        # 应用注意力分数
-        # Apply attention scores
-        x = (attn @ v).permute(0, 1, 4, 2, 3).reshape(B, C, H, W)
-        x = self.proj(x)
-        x = self.proj_drop(x)
+        # 重塑为序列格式
+        # Reshape to sequence format
+        B_new, embed_dim, H_patches, W_patches = patch_embed.shape
+        num_patches = H_patches * W_patches
         
-        return x
+        # 展平patches: (B, embed_dim, H_patches, W_patches) -> (B, num_patches, embed_dim)
+        # Flatten patches: (B, embed_dim, H_patches, W_patches) -> (B, num_patches, embed_dim)
+        patch_tokens = patch_embed.view(B_new, embed_dim, num_patches).transpose(1, 2)  # (B, num_patches, embed_dim)
+        
+        # 添加位置编码
+        # Add positional encoding
+        if num_patches <= self.pos_embed.size(1):
+            pos_embed = self.pos_embed[:, :num_patches, :]
+        else:
+            # 如果patches数量超过预设，使用插值
+            # If number of patches exceeds preset, use interpolation
+            pos_embed = torch.nn.functional.interpolate(
+                self.pos_embed.transpose(1, 2), 
+                size=num_patches, 
+                mode='linear', 
+                align_corners=False
+            ).transpose(1, 2)
+        
+        patch_tokens = patch_tokens + pos_embed
+        
+        # 归一化
+        # Normalization
+        patch_tokens = self.norm(patch_tokens)
+        
+        # 应用多头自注意力
+        # Apply multi-head self-attention
+        attn_output, _ = self.multihead_attn(patch_tokens, patch_tokens, patch_tokens)
+        
+        # 重塑回特征图格式: (B, num_patches, embed_dim) -> (B, embed_dim, H_patches, W_patches)
+        # Reshape back to feature map format: (B, num_patches, embed_dim) -> (B, embed_dim, H_patches, W_patches)
+        attn_output = attn_output.transpose(1, 2).view(B_new, embed_dim, H_patches, W_patches)
+        
+        # 通过多次升采样和卷积恢复到原始尺寸
+        # Restore to original size through multiple upsampling and convolution
+        for upsample_layer in self.upsample_layers:
+            attn_output = upsample_layer(attn_output)
+        
+        # 裁剪回原始尺寸
+        # Crop back to original size
+        if pad_h > 0 or pad_w > 0:
+            attn_output = attn_output[:, :, :H, :W]
+        
+        # 生成attention map
+        # Generate attention map
+        attention_map = self.attention_conv(attn_output)  # (B, 1, H, W)
+        
+        return attention_map
 
 
 class MultiHeadAttentionalResnetEncoder(ResnetEncoder):
-    """带多头注意力机制的ResNet编码器
-    ResNet encoder with multi-head attention mechanism
+    """带多头注意力机制的ResNet编码器，生成attention map来强调重要区域
+    ResNet encoder with multi-head attention mechanism that generates attention maps to emphasize important regions
     """
-    def __init__(self, num_layers, pretrained, num_input_images=1, num_heads=8):
+    def __init__(self, num_layers, pretrained, num_input_images=1, num_heads=8, patch_size=8, 
+                 attention_layers=None, attention_interval=2):
         super(MultiHeadAttentionalResnetEncoder, self).__init__(num_layers, pretrained, num_input_images)
         
         # 初始化多头注意力模块列表
         # Initialize multi-head attention module list
-        self.attentions = nn.ModuleList()
-        for ch in self.num_ch_enc[1:]:  # 从layer1到layer4的输出通道
-            # From layer1 to layer4 output channels
-            self.attentions.append(MultiHeadAttention(ch, num_heads=num_heads))
+        self.attentions = nn.ModuleDict()
         
-        # 添加残差连接的辅助层
-        # Add auxiliary layers for residual connection
-        self.layer_norms = nn.ModuleList()
-        for ch in self.num_ch_enc[1:]:    
-            self.layer_norms.append(nn.LayerNorm([ch]))
+        # 确定使用注意力的层
+        # Determine which layers to use attention
+        if attention_layers is not None:
+            # 如果明确指定了attention_layers，使用指定的层
+            # If attention_layers is explicitly specified, use specified layers
+            self.attention_layers = attention_layers
+        else:
+            # 否则使用间隔策略：每隔attention_interval层使用一次注意力
+            # Otherwise use interval strategy: use attention every attention_interval layers
+            self.attention_layers = []
+            for i in range(4):  # ResNet有4个主要的layer (layer1-layer4)
+                if i % attention_interval == 0:
+                    self.attention_layers.append(i)
+        
+        # 为指定的层添加注意力模块
+        # Add attention modules for specified layers
+        for layer_idx in self.attention_layers:
+            if layer_idx < len(self.num_ch_enc) - 1:  # 确保索引有效 / Ensure valid index
+                self.attentions[f'layer_{layer_idx}'] = PatchBasedMultiHeadAttention(
+                    channels=self.num_ch_enc[layer_idx + 1], 
+                    num_heads=num_heads,
+                    patch_size=patch_size
+                )
+        
+        print(f"Attention layers: {self.attention_layers} (interval: {attention_interval})")
 
     def forward(self, input_image):
         self.features = []
@@ -238,17 +353,25 @@ class MultiHeadAttentionalResnetEncoder(ResnetEncoder):
         x = self.encoder.bn1(x)
         self.features.append(self.encoder.relu(x))
         
-        # 逐层处理并添加多头注意力
-        # Process layer by layer and add multi-head attention
+        # 逐层处理并在指定层添加注意力机制
+        # Process layer by layer and add attention mechanism at specified layers
         x = self.encoder.maxpool(self.features[-1])
         for layer_idx in range(4):
             layer = getattr(self.encoder, f"layer{layer_idx+1}")
             x = layer(x)
             
-            # 添加残差连接的多头注意力
-            # Add multi-head attention with residual connection
-            attention_out = self.attentions[layer_idx](x)
-            x = x + attention_out  # 残差连接 / Residual connection
+            # 如果当前层需要使用注意力机制
+            # If the current layer needs to use attention mechanism
+            if layer_idx in self.attention_layers:
+                attention_key = f'layer_{layer_idx}'
+                if attention_key in self.attentions:
+                    # 生成attention map
+                    # Generate attention map
+                    attention_map = self.attentions[attention_key](x)  # (B, 1, H, W)
+                    
+                    # 将attention map与特征图相乘，强调重要区域
+                    # Multiply attention map with feature map to emphasize important regions
+                    x = x * attention_map  # 广播相乘 / Broadcast multiplication
             
             self.features.append(x)
         
