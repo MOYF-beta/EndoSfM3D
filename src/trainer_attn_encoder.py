@@ -11,7 +11,7 @@ endo3dac_path = os.path.join(current_dir, '..', 'endo3dac', 'utils')
 sys.path.insert(0, dares_networks_path)
 
 from dares_peft import DARES
-from resnet_encoder import AttentionalResnetEncoder, MultiHeadAttentionalResnetEncoder
+from resnet_encoder import AttentionalResnetEncoder, MultiHeadAttentionalResnetEncoder, ResnetEncoder
 from pose_decoder import PoseDecoder_with_intrinsics as PoseDecoder_i
 from optical_flow_decoder import PositionDecoder
 from appearance_flow_decoder import TransformDecoder
@@ -21,11 +21,10 @@ class TrainerAttnEncoder(Trainer):
     def load_model(self):
         # Initialize depth model
         encoders = {
-            "depth_model": DARES(use_dora=True,target_modules=['query', 'value'],full_finetune=True),
-            # NOTE +1 is the testing for apply appearance flow
-            "pose_encoder": MultiHeadAttentionalResnetEncoder(self.opt.num_layers, False, num_input_images=self.num_pose_frames),
-            "position_encoder": MultiHeadAttentionalResnetEncoder(self.opt.num_layers, False, num_input_images=2),
-            "transform_encoder": MultiHeadAttentionalResnetEncoder(self.opt.num_layers, False, num_input_images=2)
+            "depth_model": DARES(use_dora=True,target_modules=['query', 'value'],full_finetune=False),
+            "pose_encoder": AttentionalResnetEncoder(self.opt.num_layers, False, num_input_images=self.num_pose_frames),
+            "position_encoder": AttentionalResnetEncoder(self.opt.num_layers, False, num_input_images=2),
+            "transform_encoder": AttentionalResnetEncoder(self.opt.num_layers, False, num_input_images=2)
         }
 
         decoders = {
@@ -37,10 +36,6 @@ class TrainerAttnEncoder(Trainer):
                 simplified_intrinsic=self.opt.simplified_intrinsic, 
                 num_input_features=1, 
                 num_frames_to_predict_for=2,
-                auto_scale=True,
-                # use_knn=True,
-                # knn_k=5,
-                # knn_temperature=1.0
             ),
             "position": PositionDecoder(encoders["position_encoder"].num_ch_enc, self.opt.scales),
             "transform": TransformDecoder(encoders["transform_encoder"].num_ch_enc, self.opt.scales)
@@ -52,8 +47,8 @@ class TrainerAttnEncoder(Trainer):
             ("pose",                decoders["pose"],               self.param_monodepth),
             ("position_encoder",    encoders["position_encoder"],   self.param_pose_net),
             ("position",            decoders["position"],           self.param_pose_net),
-            ("transform_encoder",   encoders["transform_encoder"],  self.param_pose_net),
-            ("transform",           decoders["transform"],          self.param_pose_net)
+            ("transform_encoder",   encoders["transform_encoder"],  self.param_monodepth),
+            ("transform",           decoders["transform"],          self.param_monodepth)
         ]
         # Initialize models and parameters, and move to device
         for model_name, model_instance, param_list in all_models:
@@ -65,7 +60,7 @@ class TrainerAttnEncoder(Trainer):
         # Load pretrained weights if available
         if self.pretrained_root_dir is not None:
             model_paths = [
-            "depth_model",
+            # "depth_model",
             "position_encoder",
             "position",
             "transform_encoder",

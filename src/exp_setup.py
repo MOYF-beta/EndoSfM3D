@@ -14,8 +14,8 @@ The setup includes:
 log_path = './logs'
 
 # Default paths - update these to match your dataset locations
-DEFAULT_SCARED_PATH = '/mnt/c/Users/14152/ZCH/Dev/datasets/SCARED_Images_Resized'
-DEFAULT_C3VD_PATH = './data/C3VD_as_SCARED'
+DEFAULT_SCARED_PATH = '/workspace/data/SCARED_Images_Resized'
+DEFAULT_C3VD_PATH = ''
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 if 'cuda' in device:

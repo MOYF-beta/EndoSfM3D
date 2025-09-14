@@ -11,6 +11,7 @@ def find_best_parametric(model_loader_fn, model_name, only_keep_best=False, ds_n
                           dataset=None, eval_kwargs=None, peft=True, pose_seq=1):
     import sys
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'dares')))
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__))))
     import evaluate_pose_and_intrinsics
     warnings.filterwarnings("ignore")
     if dataset is None:
@@ -73,14 +74,21 @@ def find_best_parametric(model_loader_fn, model_name, only_keep_best=False, ds_n
             best_weight = weight
         # 位姿/内参评估 / Pose/intrinsics evaluation
         try:
-            pose_result = evaluate_pose_and_intrinsics.evaluate_model(
-                opt_dict=opt_dict,
-                weights_folder=weight_path,
+            pose_result = evaluate_pose_and_intrinsics.evaluate(
+                opt=opt_dict,
+                load_weights_folder=weight_path,
                 dataset_name=ds_name,
                 pose_seq=pose_seq,
             )
             # Use the returned score directly (lower is better)
-            if pose_result and isinstance(pose_result, (int, float)):
+            if pose_result and isinstance(pose_result, dict):
+                # Extract ATE RMSE from the results dictionary
+                if 'ate_rmse' in pose_result:
+                    ate = pose_result['ate_rmse']
+                    pose_ate_dict[weight] = ate
+                else:
+                    print(f"[WARN] No ATE RMSE found in pose evaluation results for {weight}")
+            elif pose_result and isinstance(pose_result, (int, float)):
                 ate = pose_result
                 pose_ate_dict[weight] = ate
                 if ate < best_pose_score:
@@ -128,13 +136,18 @@ def find_best_parametric(model_loader_fn, model_name, only_keep_best=False, ds_n
         if best_pose_weight in pose_ate_dict:
             pose_result = None
             try:
-                pose_result = evaluate_pose_and_intrinsics.evaluate_model(
-                    opt_dict=opt_dict,
-                    weights_folder=os.path.join(model_path, best_pose_weight),
+                pose_result = evaluate_pose_and_intrinsics.evaluate(
+                    opt=opt_dict,
+                    load_weights_folder=os.path.join(model_path, best_pose_weight),
                     dataset_name=ds_name,
                     pose_seq=pose_seq,
                 )
-                if pose_result and isinstance(pose_result, (int, float)):
+                if pose_result and isinstance(pose_result, dict):
+                    if 'ate_rmse' in pose_result:
+                        f.write(f"Best Pose Score (ATE RMSE): {pose_result['ate_rmse']:.6f}\n")
+                    else:
+                        f.write("[WARN] No ATE RMSE found in pose evaluation results\n")
+                elif pose_result and isinstance(pose_result, (int, float)):
                     f.write(f"Best Pose Score: {pose_result:.6f}\n")
             except Exception as e:
                 f.write(f"[WARN] Failed to evaluate best pose: {e}\n")

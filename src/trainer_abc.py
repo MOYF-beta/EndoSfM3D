@@ -1,188 +1,15 @@
 import json
 import os
-import random
 import time
 
 import torch
 import torch.optim as optim
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-from PIL import Image
-from dataset import DataLoaderX as DataLoader
-from torch.utils.data import RandomSampler, Sampler
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import MultiScaleStructuralSimilarityIndexMeasure
-
-# Setup paths for direct imports
-import os
-import sys
-current_dir = os.path.dirname(__file__)
-dares_path = os.path.join(current_dir, '..', 'dares')
-endo3dac_utils_path = os.path.join(current_dir, '..', 'endo3dac', 'utils')
-sys.path.insert(0, dares_path)
-sys.path.insert(0, endo3dac_utils_path)
-
-# Import from reorganized packages
 from layers import *
 from utils import *
-from endodac.utils.layers import SSILoss  # This is from endo3dac.utils.layers
-
-import torch.nn as nn
-import numpy as np
-
-def undistort_image(image, K, K_distortion, P_distortion):
-    """
-    Apply undistortion to image using camera intrinsics and distortion coefficients.
-    
-    Args:
-        image: Input image tensor [B, C, H, W]
-        K: Camera intrinsics matrix [B, 4, 4] or [B, 3, 3]
-        K_distortion: Radial distortion coefficients [B, 3] (k1, k2, k3)
-        P_distortion: Tangential distortion coefficients [B, 2] (p1, p2)
-    
-    Returns:
-        undistorted_image: Undistorted image tensor [B, C, H, W]
-        K_undistorted: Updated intrinsics matrix for undistorted image
-    """
-    B, C, H, W = image.shape
-    device = image.device
-    
-    # Extract intrinsics parameters
-    if K.shape[-1] == 4:
-        fx = K[:, 0, 0]  # [B]
-        fy = K[:, 1, 1]  # [B]
-        cx = K[:, 0, 2]  # [B]
-        cy = K[:, 1, 2]  # [B]
-    else:  # 3x3 matrix
-        fx = K[:, 0, 0]
-        fy = K[:, 1, 1]
-        cx = K[:, 0, 2]
-        cy = K[:, 1, 2]
-      # Extract distortion coefficients
-    if K_distortion.dim() == 1:
-        # If distortion coefficients are 1D (batch mean), expand to batch size
-        K_distortion = K_distortion.unsqueeze(0).expand(B, -1)
-    if P_distortion.dim() == 1:
-        P_distortion = P_distortion.unsqueeze(0).expand(B, -1)
-        
-    k1 = K_distortion[:, 0]  # [B]
-    k2 = K_distortion[:, 1]  # [B]
-    k3 = K_distortion[:, 2]  # [B]
-    p1 = P_distortion[:, 0]  # [B]
-    p2 = P_distortion[:, 1]  # [B]
-    
-    # Create coordinate grids
-    y_coords, x_coords = torch.meshgrid(
-        torch.arange(H, dtype=torch.float32, device=device),
-        torch.arange(W, dtype=torch.float32, device=device),
-        indexing='ij'
-    )
-    
-    undistorted_images = []
-    updated_K_matrices = []
-    
-    for b in range(B):
-        # Normalize coordinates to [-1, 1] range relative to principal point
-        x_norm = (x_coords - cx[b]) / fx[b]
-        y_norm = (y_coords - cy[b]) / fy[b]
-        
-        # Calculate r^2
-        r2 = x_norm**2 + y_norm**2
-        r4 = r2**2
-        r6 = r2**3
-        
-        # Apply radial distortion
-        radial_factor = 1 + k1[b] * r2 + k2[b] * r4 + k3[b] * r6
-        
-        # Apply tangential distortion
-        tangential_x = 2 * p1[b] * x_norm * y_norm + p2[b] * (r2 + 2 * x_norm**2)
-        tangential_y = p1[b] * (r2 + 2 * y_norm**2) + 2 * p2[b] * x_norm * y_norm
-        
-        # Compute distorted coordinates
-        x_distorted = x_norm * radial_factor + tangential_x
-        y_distorted = y_norm * radial_factor + tangential_y
-        
-        # Convert back to pixel coordinates
-        x_distorted_px = x_distorted * fx[b] + cx[b]
-        y_distorted_px = y_distorted * fy[b] + cy[b]
-        
-        # Normalize coordinates for grid_sample (to [-1, 1] range)
-        grid_x = 2.0 * x_distorted_px / (W - 1) - 1.0
-        grid_y = 2.0 * y_distorted_px / (H - 1) - 1.0
-        
-        # Create sampling grid [H, W, 2]
-        grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)  # [1, H, W, 2]
-        
-        # Apply undistortion by sampling from distorted locations
-        undistorted_img = F.grid_sample(
-            image[b:b+1], grid, 
-            mode='bilinear', 
-            padding_mode='border', 
-            align_corners=True
-        )
-        undistorted_images.append(undistorted_img)
-        
-        # For undistorted image, we can use the original intrinsics
-        # as the distortion has been removed
-        if K.shape[-1] == 4:
-            K_undist = K[b:b+1].clone()
-        else:
-            K_undist = torch.eye(4, device=device).unsqueeze(0)
-            K_undist[0, :3, :3] = K[b]
-        updated_K_matrices.append(K_undist)
-    
-    undistorted_image = torch.cat(undistorted_images, dim=0)
-    K_undistorted = torch.cat(updated_K_matrices, dim=0)
-    
-    return undistorted_image, K_undistorted
-
-class GlobalRandomSampler(Sampler):
-    def __init__(self, data_source):
-        self.data_source = data_source
-
-    def __iter__(self):
-        indices = list(range(len(self.data_source)))
-        random.shuffle(indices)
-        return iter(indices)
-
-    def __len__(self):
-        return len(self.data_source)
-
-class ConcatDatasetSampler(Sampler):
-    def __init__(self, dataset):
-        if isinstance(dataset, torch.utils.data.ConcatDataset):
-            self.concat_dataset = dataset
-            self.cumulative_sizes = dataset.cumulative_sizes
-            print(f'cumulative_sizes: {self.cumulative_sizes}')
-        else:
-            self.concat_dataset = None
-            self.dataset = dataset
-            print("\033[91m WARNING: Dataset is not a ConcatDataset, using GlobalRandomSampler instead.\033[0m")
-
-    def __iter__(self):
-        if self.concat_dataset:
-            indices = []
-            start = 0
-            for end in self.cumulative_sizes:
-                dataset_len = end - start
-                perm = torch.randperm(dataset_len).tolist()
-                global_perm = [p + start for p in perm]
-                indices.extend(global_perm)
-                start = end
-            return iter(indices)
-        else:
-            indices = list(range(len(self.dataset)))
-            random.shuffle(indices)
-            return iter(indices)
-
-    def __len__(self):
-        if self.concat_dataset:
-            return len(self.concat_dataset)
-        else:
-            return len(self.dataset)
-    
-import torch
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 from abc import ABC, abstractmethod
 class Trainer(ABC):
 
@@ -191,24 +18,13 @@ class Trainer(ABC):
         pass
 
     def __init__(self, model_name, log_dir, options, train_eval_ds={},
-                  pretrained_root_dir=None, merge_val_as_train=False, 
-                  use_supervised_loss = False, debug = False, use_af_pose=False,
-                  accumulate_position_gradients_for_pose=False, save_samples_num=10):
-        if debug:
-            print("\033[91m WARNING: Debug mode activated, only train 1 epoch\033[0m")
-            options.num_epochs = 2
-            options.batch_size = 8
-        if options.self_ssi:
-            assert options.self_ssi_constraint is not None, "self_ssi_constraint must be set if self_ssi is enabled"
-        self.use_af_pose = use_af_pose
-        self.accumulate_position_gradients_for_pose = accumulate_position_gradients_for_pose
+                  pretrained_root_dir=None, merge_val_as_train=False):
         self.opt = options
         self.log_path = os.path.join(log_dir, model_name)
-        self.use_supervised_loss = use_supervised_loss
+
         self.models = {}  
         self.param_monodepth = []  
         self.param_pose_net = []
-        self.save_samples_num = save_samples_num
         
         self.device = device
         self.train_pos = False
@@ -223,33 +39,29 @@ class Trainer(ABC):
         self.optimizer_pose = optim.Adam(self.param_pose_net, self.opt.pos_learning_rate, eps=1e-7, weight_decay=self.opt.weight_decay)
         self.lr_scheduler_pose = optim.lr_scheduler.StepLR(self.optimizer_pose, self.opt.scheduler_step_size, 0.1)
         
-        self.optimizer_depth = optim.Adam(self.param_monodepth, self.opt.learning_rate, eps=1e-7, weight_decay=self.opt.weight_decay_pose)
+        self.optimizer_depth = optim.Adam(self.param_monodepth, self.opt.learning_rate, eps=1e-7, weight_decay=self.opt.weight_decay)
         self.lr_scheduler_depth = optim.lr_scheduler.StepLR(self.optimizer_depth, self.opt.scheduler_step_size, 0.1)
 
 
         train_dataset = train_eval_ds["train"]
         val_dataset = train_eval_ds["val"]
         
-        if 'train_sampler' in train_eval_ds:
-            train_sampler = train_eval_ds['train_sampler'](train_dataset)
-        else:
-            train_sampler = GlobalRandomSampler(train_dataset)
+        
         if merge_val_as_train:
             print("\033[91m WARNING: Merging validation dataset into training dataset\033[0m")
             combined_dataset = torch.utils.data.ConcatDataset([train_dataset, val_dataset])
             self.train_loader = DataLoader(
-            combined_dataset, self.opt.batch_size,
-            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True, sampler=train_sampler)
+            combined_dataset, self.opt.batch_size, True,
+            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
         else:
             self.train_loader = DataLoader(
-            train_dataset, self.opt.batch_size,
-            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True, sampler=train_sampler)
+            train_dataset, self.opt.batch_size, True,
+            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
             self.val_loader = DataLoader(
             val_dataset, self.opt.batch_size, False,
             num_workers=1, pin_memory=True, drop_last=True)
             self.val_iter = iter(self.val_loader)
-
-        
+            
         num_train_samples = len(train_eval_ds['train'])
         self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
         self.writers = {}
@@ -259,10 +71,6 @@ class Trainer(ABC):
         if not self.opt.no_ssim:
             self.ms_ssim = MultiScaleStructuralSimilarityIndexMeasure(data_range=1.0)
             self.ms_ssim.to(self.device)
-        # Add Self-SSI loss initialization
-        if self.opt.self_ssi:
-            self.self_ssi = SSILoss()
-            self.self_ssi.to(self.device)
 
         self.spatial_transform = SpatialTransformer((self.opt.height, self.opt.width))
         self.spatial_transform.to(self.device)
@@ -299,33 +107,30 @@ class Trainer(ABC):
 
         self.save_opts()
     
-    def set_train(self, train_position_only=False, freeze_depth=False):
-        """Enable or disable gradients based on optimizer groups."""
-        # Switch model modes: when training position only, keep depth_model in eval, others in train; otherwise all train
-        for name, model in self.models.items():
-            model.train()
-        # Freeze/unfreeze depth parameters
-        for group in self.optimizer_depth.param_groups:
-            for p in group['params']:
-                p.requires_grad = not train_position_only
-        # Freeze/unfreeze pose parameters
-        for group in self.optimizer_pose.param_groups:
-            for p in group['params']:
-                p.requires_grad = train_position_only  or self.accumulate_position_gradients_for_pose
-        if freeze_depth:
-            for param in self.models["depth_model"].parameters():
-                param.requires_grad = False
-            self.models["depth_model"].eval()
+    def set_train(self, train_position_only=False):
+        """Convert models to training/eval mode based on position training flag"""
+        # Define position-related models
+        position_models = ["position_encoder", "position"]
+        
+        # Set requires_grad and model mode for each model
+        for model_name in self.models:
+            requires_grad = (not train_position_only)or(model_name in position_models)
 
+            for param in self.models[model_name].parameters():
+                param.requires_grad = requires_grad
+            
+            # Set model mode (train/eval)
+            if requires_grad:
+                self.models[model_name].train()
+            else:
+                self.models[model_name].eval()
+                
     def set_eval(self):
         """Convert all models to testing/evaluation mode"""
-        for name, model in self.models.items():
-            for param in model.parameters():
-                param.requires_grad = False
         self.models["depth_model"].eval()
         self.models["transform_encoder"].eval()
         self.models["transform"].eval()
-        self.models["pose_encoder"].eval() if "pose_encoder" in self.models else None
+        self.models["pose_encoder"].eval()
         self.models["pose"].eval()
 
     def train(self):
@@ -337,10 +142,6 @@ class Trainer(ABC):
             self.run_epoch()
             if (self.epoch + 1) % self.opt.save_frequency == 0:
                 self.save_model()
-        
-        # Save samples after training if save_samples_num > 0
-        if self.save_samples_num > 0:
-            self.save_depth_samples()
 
     def run_epoch(self):
         """Run a single epoch of training and validation"""
@@ -353,39 +154,19 @@ class Trainer(ABC):
             self.set_train(train_position_only=True)
             outputs, losses = self.process_batch_position(inputs)
             loss_pose = losses["loss"]
-            if self.accumulate_position_gradients_for_pose:
-                for param in self.param_pose_net:
-                    if param.grad is not None:
-                        param.grad.data *= 0.1
-                loss_pose.backward()
-                self.optimizer_pose.step()
-                self.optimizer_pose.zero_grad()    
-            else:
-                self.optimizer_pose.zero_grad()
-                loss_pose.backward()
-                self.optimizer_pose.step()            # Train depth
-            ssi_warming_up = self.opt.self_ssi and self.epoch < int(self.opt.warm_up_step)
-            # print(f"Epoch {self.epoch}, batch {batch_idx}, ssi_warming_up: {ssi_warming_up}",end = '\r')
-            random_train = random.random() < 0.1 * (self.epoch+1)
-            
-            # Determine whether to train depth network
-            # - If self_ssi is disabled: always train
-            # - If self_ssi is enabled but not in warming up: always train  
-            # - If self_ssi is enabled and in warming up: train with probability
-            should_train_depth = True # not self.opt.self_ssi or not ssi_warming_up or random_train
-            
-            if should_train_depth:
-                self.set_train(train_position_only=False, freeze_depth=ssi_warming_up if self.opt.self_ssi else False)
-                outputs, losses = self.process_batch_depth(inputs)
-                loss_depth = losses["loss"]
 
-                self.optimizer_depth.zero_grad()
-                loss_depth.backward()
-                self.optimizer_depth.step()
-            else:
-                self.set_eval()
-                outputs, losses = self.process_batch_depth(inputs)
-                loss_depth = losses["loss"]
+            self.optimizer_pose.zero_grad()
+            loss_pose.backward()
+            self.optimizer_pose.step()
+
+            # Train depth
+            self.set_train(train_position_only=False)
+            outputs, losses = self.process_batch_depth(inputs)
+            loss_depth = losses["loss"]
+
+            self.optimizer_depth.zero_grad()
+            loss_depth.backward()
+            self.optimizer_depth.step()
 
             duration = time.time() - before_op_time
 
@@ -509,11 +290,6 @@ class Trainer(ABC):
 
                     # Pose (if disps is provided)
                     if disps is not None:
-                        # NOTE test: merge appearance flow onto pose
-                        if self.use_af_pose:
-                            inputs_all = [pose_feats[f_i], pose_feats[0], outputs[("transform", "high", 0, f_i)]]
-                        else:
-                            inputs_all = [pose_feats[f_i], pose_feats[0]]
                         pose_inputs = [self.models["pose_encoder"](torch.cat(inputs_all, 1))]
                         if self.opt.learn_intrinsics:
                             axisangle, translation, intrinsics = self.models["pose"](pose_inputs)
@@ -540,7 +316,7 @@ class Trainer(ABC):
             else:
                 disp = F.interpolate(
                     disp, [self.opt.height, self.opt.width], mode="bilinear", align_corners=True)
-            
+
             _, depth = disp_to_depth(disp, self.opt.min_depth, self.opt.max_depth)
 
             outputs[("depth", 0, scale)] = depth
@@ -563,31 +339,12 @@ class Trainer(ABC):
                     mean_inv_depth = inv_depth.mean(3, True).mean(2, True)
 
                     T = transformation_from_parameters(
-                        axisangle[:, 0], translation[:, 0] * mean_inv_depth[:, 0], frame_id < 0)                
-                if self.opt.predict_distortion:
-                    K, K_distortion, P_distortion = outputs["estimated_intrinsics"]
-                    
-                    # Apply undistortion to the target frame image
-                    target_image = inputs[("color", frame_id, source_scale)]
-                    undistorted_target, K_undistorted = undistort_image(
-                        target_image, K, K_distortion, P_distortion)
-                    
-                    # Use undistorted intrinsics for projection
-                    inv_K_undistorted = torch.inverse(K_undistorted)
-                    cam_points = self.backproject_depth[source_scale](
-                        depth, inv_K_undistorted)
-                    pix_coords = self.project_3d[source_scale](
-                        cam_points, K_undistorted, T)
-                      # Sample from undistorted image
-                    outputs[("color", frame_id, scale)] = F.grid_sample(
-                        undistorted_target,
-                        pix_coords,
-                        padding_mode="border",
-                        align_corners=True)
-                    
-                elif self.opt.learn_intrinsics:
+                        axisangle[:, 0], translation[:, 0] * mean_inv_depth[:, 0], frame_id < 0)
+
+                if self.opt.learn_intrinsics:
                     K = outputs["estimated_intrinsics"]
                     inv_K = torch.inverse(K)
+                
 
                     cam_points = self.backproject_depth[source_scale](
                         depth, inv_K)
@@ -601,40 +358,14 @@ class Trainer(ABC):
 
                 outputs[("sample", frame_id, scale)] = pix_coords
 
-                # Only apply grid_sample for non-distortion cases
-                # (distortion case already handled above)
-                if not self.opt.predict_distortion:
-                    outputs[("color", frame_id, scale)] = F.grid_sample(
-                        inputs[("color", frame_id, source_scale)],
-                        outputs[("sample", frame_id, scale)],
-                        padding_mode="border",
-                        align_corners=True)
+                outputs[("color", frame_id, scale)] = F.grid_sample(
+                    inputs[("color", frame_id, source_scale)],
+                    outputs[("sample", frame_id, scale)],
+                    padding_mode="border",
+                    align_corners=True)
 
                 outputs[("position_depth", scale, frame_id)] = self.position_depth[source_scale](
                         cam_points, inputs[("K", source_scale)], T)
-                # Add generation of transformed disparity for self-ssi
-                if self.opt.self_ssi and self.epoch >= self.opt.warm_up_step:
-                    t_to_s_disp = F.grid_sample(
-                        outputs[("disp", scale)],
-                        outputs[("sample", frame_id, scale)],
-                        padding_mode="border",
-                        align_corners=True)
-                    outputs[("t_to_s_disp", frame_id, scale)] = t_to_s_disp
-       
-
-    def compute_supervised_loss(self, inputs, outputs, debug=False):
-        if 'depth_gt' in inputs.keys() and inputs['depth_gt'].any():
-            depth_gt = inputs['depth_gt']
-        else:
-            return 0
-        depth_pred = outputs[("depth", 0, 0)] * self.opt.max_depth
-        mask = (depth_gt > self.opt.min_depth) & (depth_gt < self.opt.max_depth)
-            
-        depth_pred = depth_pred[mask]
-        depth_gt = depth_gt[mask]
-
-        return nn.L1Loss()(depth_pred, depth_gt)
-        
 
     def compute_reprojection_loss(self, pred, target):
 
@@ -648,12 +379,6 @@ class Trainer(ABC):
             reprojection_loss = 0.9 * ms_ssim_loss + 0.1 * l1_loss
 
         return reprojection_loss
-    
-    def compute_of_loss(self, of, depth, pose, mask=None):
-        '''with depth and pose, we are able to synthesize the optical flow
-        compute the loss between the synthesized optical flow and the predicted optical flow
-        '''
-        pass
 
     def compute_position_losses(self, inputs, outputs):
         """Compute losses for position optimization"""
@@ -672,7 +397,7 @@ class Trainer(ABC):
                 loss_registration += (
                     self.compute_reprojection_loss(
                         outputs[("registration", scale, frame_id)], 
-                        outputs[("refined", scale, frame_id)]#.detach() # important : now dont use transform loss, instead, this is combined into the registration loss
+                        outputs[("refined", scale, frame_id)].detach()
                     ) * occu_mask_backward
                 ).sum() / occu_mask_backward.sum()
 
@@ -694,8 +419,6 @@ class Trainer(ABC):
         for scale in self.opt.scales:
             loss = 0
             loss_reprojection = 0
-            # Add self-ssi accumulation
-            loss_self_ssi = 0
 
             disp = outputs[("disp", scale)]
             color = inputs[("color", 0, scale)]
@@ -709,40 +432,8 @@ class Trainer(ABC):
                         outputs[("color", frame_id, scale)], 
                         outputs[("refined", scale, frame_id)]
                     ) * occu_mask_backward
-                ).sum() / occu_mask_backward.sum()                # Add self-ssi loss term
-                if self.opt.self_ssi and self.epoch >= self.opt.warm_up_step:
-                    # Ensure both tensors have the same size for SSI loss
-                    disp_original = outputs[("disp", scale)]
-                    disp_transformed = outputs[("t_to_s_disp", frame_id, scale)]
-                    
-                    # Resize transformed disparity to match original if needed
-                    if disp_original.shape != disp_transformed.shape:
-                        disp_transformed = F.interpolate(
-                            disp_transformed, 
-                            size=disp_original.shape[-2:], 
-                            mode="bilinear", 
-                            align_corners=True
-                        )
-                    
-                    # Also ensure mask has the same size
-                    mask = occu_mask_backward
-                    if mask.shape != disp_original.shape:
-                        mask = F.interpolate(
-                            mask.float(), 
-                            size=disp_original.shape[-2:], 
-                            mode="bilinear", 
-                            align_corners=True
-                        )
-                    
-                    loss_self_ssi += self.self_ssi(
-                        disp_original,
-                        disp_transformed,
-                        mask)
-
-            # Add weighted self-ssi constraint
-            if self.opt.self_ssi and self.epoch >= self.opt.warm_up_step:
-                loss += self.opt.self_ssi_constraint * loss_self_ssi
-
+                ).sum() / occu_mask_backward.sum()
+                
             # Compute disparity smoothness loss
             mean_disp = disp.mean(2, True).mean(3, True)
             norm_disp = disp / (mean_disp + 1e-7)
@@ -752,11 +443,8 @@ class Trainer(ABC):
             loss += loss_reprojection / 2.0
             loss += self.opt.disparity_smoothness * disp_smooth_loss / (2 ** scale)
 
-            # supervised loss
-            if self.use_supervised_loss:
-                loss += self.compute_supervised_loss(inputs, outputs)  * 0.001
             total_loss += loss
-            losses[f"loss/{scale}"] = loss
+            losses["loss/{}".format(scale)] = loss
 
         total_loss /= self.num_scales
         losses["loss"] = total_loss
@@ -789,12 +477,6 @@ class Trainer(ABC):
                     writer.add_image(
                         "disp_0",
                         normalize_image(outputs[("disp", 0)][j]), self.step)
-                    writer.add_image(
-                        "refined_0",
-                        normalize_image(outputs[("refined", 0, 1)][j]), self.step)
-                    writer.add_image(
-                        "registration_0",
-                        normalize_image(outputs[("registration", 0, 1)][j]), self.step)
 
     def save_opts(self):
         """Save options to disk so we know what we ran this experiment with
@@ -826,82 +508,3 @@ class Trainer(ABC):
 
         save_path = os.path.join(save_folder, "{}.pth".format("adam"))
         torch.save(self.optimizer_pose.state_dict(), save_path)
-
-    def save_depth_samples(self):
-        """Save depth visualization samples from training dataset"""
-        print(f"\033[92mSaving {self.save_samples_num} depth visualization samples...\033[0m")
-        
-        # Create samples directory
-        samples_dir = os.path.join(self.log_path, "depth_samples")
-        if not os.path.exists(samples_dir):
-            os.makedirs(samples_dir)
-        
-        # Set model to evaluation mode
-        self.set_eval()
-        
-        # Get training dataset
-        train_dataset = self.train_loader.dataset
-        if hasattr(train_dataset, 'datasets'):  # ConcatDataset
-            dataset_len = len(train_dataset.datasets[0])
-        else:
-            dataset_len = len(train_dataset)
-        
-        # Calculate indices for evenly spaced samples
-        step = max(1, dataset_len // self.save_samples_num)
-        sample_indices = [i * step for i in range(self.save_samples_num)]
-        
-        with torch.no_grad():
-            for idx, sample_idx in enumerate(sample_indices):
-                if sample_idx >= dataset_len:
-                    break
-                    
-                # Get sample from dataset
-                if hasattr(train_dataset, 'datasets'):  # ConcatDataset
-                    sample = train_dataset.datasets[0][sample_idx]
-                else:
-                    sample = train_dataset[sample_idx]
-                
-                # Prepare inputs
-                inputs = {}
-                for key, value in sample.items():
-                    if isinstance(value, torch.Tensor):
-                        inputs[key] = value.unsqueeze(0).to(self.device)
-                    else:
-                        inputs[key] = value
-                  # Get depth prediction
-                try:
-                    depth_input = self.get_depth_input(inputs)
-                    outputs = self.models["depth_model"](depth_input)
-                except Exception as e:
-                    print(f"Warning: Failed to process sample {sample_idx}: {e}")
-                    continue
-                
-                # Convert disparity to depth
-                disp = outputs[("disp", 0)]
-                _, depth = disp_to_depth(disp, self.opt.min_depth, self.opt.max_depth)
-                
-                # Save original image
-                color_img = inputs[("color", 0, 0)].squeeze().cpu()
-                if color_img.shape[0] == 3:  # RGB
-                    color_img = color_img.permute(1, 2, 0)
-                color_img = (color_img.numpy() * 255).astype(np.uint8)
-                
-                color_pil = Image.fromarray(color_img)
-                color_path = os.path.join(samples_dir, f"sample_{idx:03d}_color.png")
-                color_pil.save(color_path)
-                
-                # Save depth visualization
-                depth_img = depth.squeeze().cpu().numpy()
-                plt.figure(figsize=(10, 6))
-                plt.imshow(depth_img, cmap='plasma')
-                plt.colorbar(label='Depth (m)')
-                plt.title(f'Predicted Depth - Sample {idx}')
-                plt.axis('off')
-                
-                depth_path = os.path.join(samples_dir, f"sample_{idx:03d}_depth.png")
-                plt.savefig(depth_path, bbox_inches='tight', dpi=150)
-                plt.close()
-                
-                print(f"Saved sample {idx+1}/{self.save_samples_num}: {color_path}, {depth_path}")
-        
-        print(f"\033[92mCompleted saving depth samples to: {samples_dir}\033[0m")

@@ -21,7 +21,7 @@ DefaultOpt_dict = {
         "other_frame_init_weight" : 1e-5,
 
         # OPTIMIZATION options
-        "batch_size": 12,
+        "batch_size": 10,
         "learning_rate": 1e-5,
         "weight_decay": 1e-7,
         "weight_decay_pose" : 1e-4,

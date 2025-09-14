@@ -20,7 +20,7 @@ except ImportError:
 
 # Default splits directory - can be overridden
 platform = 'local' if os.getcwd().startswith('/mnt') else 'cluster'
-ds_base = '/mnt/c/Users/14152/ZCH/Dev/datasets' if platform == 'local' else '/cluster/project7/Llava_2024/changhao/datasets'
+ds_base = '/workspace/data'
 splits_dir = os.path.join(ds_base, 'C3VD_as_SCARED', 'splits')
 #cv2.setNumThreads(0)  # This speeds up evaluation 5x on our unix systems (OpenCV 3.3.1)
 

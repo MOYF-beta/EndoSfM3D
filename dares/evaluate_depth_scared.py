@@ -33,7 +33,7 @@ cv2.setNumThreads(0)
 
 # Constants that were imported from exp_setup_local
 platform = 'local' if os.getcwd().startswith('/mnt') else 'cluster'
-ds_base = '/mnt/c/Users/14152/ZCH/Dev/datasets' if platform == 'local' else '/cluster/project7/Llava_2024/changhao/datasets'
+ds_base = '/workspace/data'
 splits_dir = os.path.join(ds_base, 'SCARED_Images_Resized', 'splits')
 gt_path = os.path.join(splits_dir, "gt_depths.npz")
 if os.path.exists(gt_path):
