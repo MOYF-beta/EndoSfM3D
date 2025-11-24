@@ -2,6 +2,9 @@
 
 ## Setup Instructions
 
+SCARED/C3VD/Pitvis depth model
+
+[https://drive.google.com/drive/folders/1ZQs3xetmPDhBd64OOs7K9E_HBfccCLwz?usp=drive_link]
 ## Implementation Details
 
 This experiment implements an attention encoder with DoRA (Weight-Decomposed Low-Rank Adaptation) for endoscopic depth estimation:
