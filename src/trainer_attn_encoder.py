@@ -10,7 +10,9 @@ endo3dac_path = os.path.join(current_dir, '..', 'endo3dac', 'utils')
 
 sys.path.insert(0, dares_networks_path)
 
-from dares_peft import DARES
+# Use compatibility module to support OLD_DARES_ARCH environment variable
+from dares_compat import get_DARES_class
+DARES = get_DARES_class()
 from resnet_encoder import AttentionalResnetEncoder, MultiHeadAttentionalResnetEncoder, ResnetEncoder
 from pose_decoder import PoseDecoder_with_intrinsics as PoseDecoder_i
 from optical_flow_decoder import PositionDecoder
