@@ -24,6 +24,7 @@ def load_pose_encoder_decoder_DARES(opt ):
     return pose_encoder, pose_decoder
 
 def load_DARES(opt, weight_path=None, pth_name='depth_model.pth', refine=False, peft=True):
+    # Add dares/networks to path for imports
     import sys
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'dares', 'networks')))
     

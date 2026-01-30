@@ -22,25 +22,15 @@ def get_dares_module():
         
     Environment Variables:
         OLD_DARES_ARCH: When set to '1', uses legacy dares module instead of dares_peft
+        
+    Note:
+        The environment variable should be set before importing any modules that use DARES.
+        Module caching is handled by Python's import system.
     """
     use_old_arch = os.environ.get('OLD_DARES_ARCH', '0') == '1'
     
     # Determine which module to import
     module_name = 'dares' if use_old_arch else 'dares_peft'
-    
-    # Clear any cached imports to respect environment variable changes
-    full_module_names = [module_name]
-    
-    # Try to construct full module path if we're in a package
-    if '.' in __name__:
-        parent_module = '.'.join(__name__.split('.')[:-1])
-        full_module_names.append(f"{parent_module}.{module_name}")
-    
-    # Try importing with each method
-    for full_name in full_module_names:
-        # Remove from cache if it exists to allow reload
-        if full_name in sys.modules:
-            del sys.modules[full_name]
     
     try:
         # Direct import (when dares/networks is in sys.path)

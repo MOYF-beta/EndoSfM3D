@@ -24,10 +24,17 @@ from dares_compat import get_DARES_class
 
 try:
     DARES = get_DARES_class()
-    print('   ✗ Should have failed (no transformers installed)')
+    # If we get here, dependencies are installed - check it's the right module
+    import inspect
+    module_file = inspect.getfile(DARES)
+    if 'dares_peft' in module_file:
+        print('   ✓ Correctly using dares_peft module')
+    else:
+        print(f'   ✗ Unexpected module: {module_file}')
 except ImportError as e:
+    # Dependencies not installed - check error message to confirm correct module was attempted
     if 'dares_peft' in str(e) or 'transformers' in str(e):
-        print('   ✓ Correctly tries to import dares_peft by default')
+        print('   ✓ Correctly tries to import dares_peft (dependencies not installed)')
     else:
         print(f'   ✗ Unexpected error: {e}')
 
@@ -75,5 +82,3 @@ else:
 
 print('\n' + '=' * 50)
 print('✓ Integration test completed!')
-
-

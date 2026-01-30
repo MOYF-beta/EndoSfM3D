@@ -50,8 +50,6 @@ def test_model_loading():
     
     try:
         # Use compatibility module to support OLD_DARES_ARCH environment variable
-        import sys
-        sys.path.append(os.path.join(os.path.dirname(__file__), 'dares', 'networks'))
         from dares_compat import get_DARES_class
         DARES = get_DARES_class()
         model = DARES(use_dora=True, target_modules=['query', 'value'], full_finetune=True)
