@@ -10,6 +10,7 @@ Otherwise, it uses the newer 'dares_peft' module (default).
 
 import os
 import sys
+import importlib
 
 
 def get_dares_module():
@@ -27,24 +28,26 @@ def get_dares_module():
     # Determine which module to import
     module_name = 'dares' if use_old_arch else 'dares_peft'
     
-    # Try different import methods to handle various contexts
+    # Clear any cached imports to respect environment variable changes
+    full_module_names = [module_name]
+    
+    # Try to construct full module path if we're in a package
+    if '.' in __name__:
+        parent_module = '.'.join(__name__.split('.')[:-1])
+        full_module_names.append(f"{parent_module}.{module_name}")
+    
+    # Try importing with each method
+    for full_name in full_module_names:
+        # Remove from cache if it exists to allow reload
+        if full_name in sys.modules:
+            del sys.modules[full_name]
+    
     try:
-        # Try relative import first (when used as part of dares.networks package)
-        if '.' in __name__:
-            parent_module = '.'.join(__name__.split('.')[:-1])
-            full_module_name = f"{parent_module}.{module_name}"
-            module = __import__(full_module_name, fromlist=[module_name])
-        else:
-            # Direct import (when dares/networks is in sys.path)
-            module = __import__(module_name)
+        # Direct import (when dares/networks is in sys.path)
+        module = importlib.import_module(module_name)
         return module
     except ImportError as e:
-        # Fallback: try direct import
-        try:
-            module = __import__(module_name)
-            return module
-        except ImportError:
-            raise ImportError(f"Failed to import {module_name}: {e}")
+        raise ImportError(f"Failed to import {module_name}: {e}")
 
 
 def get_DARES_class():
